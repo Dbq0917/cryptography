@@ -436,6 +436,245 @@ fn check_decrypt_parameters<'p>(
     Ok(())
 }
 
+#[pyo3::pyfunction]
+#[pyo3(signature = (data, content=None, certificates=None))]
+fn verify_der<'p>(
+    py: pyo3::Python<'p>,
+    data: pyo3::Py<pyo3::types::PyBytes>,
+    content: Option<CffiBuf<'p>>,
+    certificates: Option<Vec<pyo3::Bound<'p, x509::certificate::Certificate>>>,
+) -> CryptographyResult<()> {
+    verify_signed_data(
+        py,
+        data,
+        content.as_ref().map(|c| c.as_bytes()),
+        certificates,
+    )
+}
+
+#[pyo3::pyfunction]
+#[pyo3(signature = (data, content=None, certificates=None))]
+fn verify_pem<'p>(
+    py: pyo3::Python<'p>,
+    data: &[u8],
+    content: Option<CffiBuf<'p>>,
+    certificates: Option<Vec<pyo3::Bound<'p, x509::certificate::Certificate>>>,
+) -> CryptographyResult<()> {
+    let pem_str = std::str::from_utf8(data)
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("Invalid PEM data"))?;
+    let pem = pem::parse(pem_str)
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("Failed to parse PEM data"))?;
+
+    if pem.tag() != "PKCS7" {
+        return Err(CryptographyError::from(
+            pyo3::exceptions::PyValueError::new_err(
+                "The provided PEM data does not have the PKCS7 tag.",
+            ),
+        ));
+    }
+
+    let data = pyo3::types::PyBytes::new(py, pem.contents()).unbind();
+    verify_signed_data(
+        py,
+        data,
+        content.as_ref().map(|c| c.as_bytes()),
+        certificates,
+    )
+}
+
+fn verify_signed_data<'p>(
+    py: pyo3::Python<'p>,
+    data: pyo3::Py<pyo3::types::PyBytes>,
+    content: Option<&[u8]>,
+    certificates: Option<Vec<pyo3::Bound<'p, x509::certificate::Certificate>>>,
+) -> CryptographyResult<()> {
+    let content_info = asn1::parse_single::<pkcs7::ContentInfo<'_>>(data.as_bytes(py))?;
+    let pkcs7::Content::SignedData(signed_data) = content_info.content else {
+        return Err(CryptographyError::from(
+            pyo3::exceptions::PyValueError::new_err(
+                "The PKCS7 data is not a SignedData structure.",
+            ),
+        ));
+    };
+    let signed_data = signed_data.into_inner();
+
+    let embedded_content = match signed_data.content_info.content {
+        pkcs7::Content::Data(embedded) => embedded.map(asn1::Explicit::into_inner),
+        _ => {
+            return Err(CryptographyError::from(
+                pyo3::exceptions::PyValueError::new_err(
+                    "The PKCS7 SignedData does not contain a data content type.",
+                ),
+            ));
+        }
+    };
+
+    let content_bytes: &[u8] = match (embedded_content, content) {
+        (Some(_), Some(_)) => {
+            return Err(CryptographyError::from(
+                pyo3::exceptions::PyValueError::new_err(
+                    "content must not be provided when the PKCS7 data \
+                     contains embedded content.",
+                ),
+            ));
+        }
+        (Some(embedded), None) => embedded,
+        (None, Some(provided)) => provided,
+        (None, None) => {
+            return Err(CryptographyError::from(
+                pyo3::exceptions::PyValueError::new_err(
+                    "The PKCS7 data contains no content, so the detached \
+                     content must be provided.",
+                ),
+            ));
+        }
+    };
+
+    // Candidate signer certificates are the ones embedded in the SignedData
+    // plus any the caller provided.
+    let mut candidate_certs = certificates.unwrap_or_default();
+    if signed_data.certificates.is_some() {
+        let py_certs = try_list_of_certificates(py, data.clone_ref(py), |data, cb| {
+            let p7 = asn1::parse_single::<pkcs7::ContentInfo<'_>>(data.as_bytes(py))?;
+            if let pkcs7::Content::SignedData(signed_data) = p7.content {
+                if let Some(certs) = signed_data.into_inner().certificates {
+                    for c in certs.unwrap_read().clone() {
+                        cb(c)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        for cert in py_certs.iter() {
+            candidate_certs.push(cert.cast::<x509::certificate::Certificate>()?.clone());
+        }
+    }
+
+    // Each SignerInfo is verified independently, dispatching on the
+    // signature algorithm identifier it declares. Verification succeeds as
+    // soon as one signer with a supported algorithm verifies; unsupported
+    // algorithms are skipped and reported only if no signer verifies.
+    let mut saw_supported_signer = false;
+    for signer_info in signed_data.signer_infos.unwrap_read().clone() {
+        let signature_algorithm = &signer_info.digest_encryption_algorithm;
+        // In PKCS#7, RSA PKCS#1 v1.5 signatures are represented with the
+        // rsaEncryption OID and the hash is taken from the digestAlgorithm
+        // field. See RFC 3370 (section 3.2).
+        let is_rsa_pkcs1v15 = matches!(
+            signature_algorithm.params,
+            common::AlgorithmParameters::Rsa(_)
+        );
+        let is_supported = is_rsa_pkcs1v15
+            || matches!(
+                signature_algorithm.params,
+                common::AlgorithmParameters::RsaPss(_)
+                    | common::AlgorithmParameters::EcDsaWithSha224
+                    | common::AlgorithmParameters::EcDsaWithSha256
+                    | common::AlgorithmParameters::EcDsaWithSha384
+                    | common::AlgorithmParameters::EcDsaWithSha512
+                    | common::AlgorithmParameters::MlDsa44
+                    | common::AlgorithmParameters::MlDsa65
+                    | common::AlgorithmParameters::MlDsa87
+            );
+        if !is_supported {
+            continue;
+        }
+        saw_supported_signer = true;
+
+        let Some(signer_cert) = candidate_certs.iter().find(|cert| {
+            let raw = cert.get().raw.borrow_dependent();
+            raw.tbs_cert.serial == signer_info.issuer_and_serial_number.serial_number
+                && raw.tbs_cert.issuer == signer_info.issuer_and_serial_number.issuer
+        }) else {
+            continue;
+        };
+
+        let Ok(py_hash) =
+            x509::sign::hash_oid_py_hash(py, signer_info.digest_algorithm.oid().clone())
+        else {
+            continue;
+        };
+
+        let signed_bytes = match &signer_info.authenticated_attributes {
+            Some(attrs) => {
+                // The messageDigest attribute must contain the digest of the
+                // content computed with the signer's digest algorithm.
+                let expected_digest = x509::ocsp::hash_data(py, &py_hash, content_bytes)?;
+                let mut digest_matches = false;
+                for attr in attrs.unwrap_read().clone() {
+                    if attr.type_id == PKCS7_MESSAGE_DIGEST_OID {
+                        let values: Vec<_> = attr.values.unwrap_read().clone().collect();
+                        if values.len() == 1
+                            && values[0].tag() == asn1::Tag::primitive(4)
+                            && values[0].data() == expected_digest.as_bytes()
+                        {
+                            digest_matches = true;
+                        }
+                    }
+                }
+                if !digest_matches {
+                    continue;
+                }
+                // The signature is computed over the complete DER encoding
+                // of the signed attributes, including the SET OF tag.
+                asn1::write_single(attrs.unwrap_read())?
+            }
+            None => content_bytes.to_vec(),
+        };
+
+        let public_key = signer_cert.call_method0(pyo3::intern!(py, "public_key"))?;
+        let verify_result: CryptographyResult<()> = if is_rsa_pkcs1v15 {
+            let padding = types::PKCS1V15.get(py)?.call0()?;
+            public_key
+                .call_method1(
+                    pyo3::intern!(py, "verify"),
+                    (
+                        signer_info.encrypted_digest,
+                        &signed_bytes,
+                        padding,
+                        &py_hash,
+                    ),
+                )
+                .map(|_| ())
+                .map_err(CryptographyError::from)
+        } else {
+            x509::sign::verify_signature_with_signature_algorithm(
+                py,
+                public_key,
+                signature_algorithm,
+                signer_info.encrypted_digest,
+                &signed_bytes,
+            )
+        };
+        match verify_result {
+            Ok(()) => return Ok(()),
+            // A signer whose key type, algorithm, or signature does not
+            // check out is skipped; other signers may still verify.
+            Err(CryptographyError::Py(ref e))
+                if e.is_instance_of::<exceptions::InvalidSignature>(py)
+                    || e.is_instance_of::<pyo3::exceptions::PyValueError>(py)
+                    || e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if saw_supported_signer {
+        Err(CryptographyError::from(
+            exceptions::InvalidSignature::new_err("No valid signature found in the PKCS7 data."),
+        ))
+    } else {
+        Err(CryptographyError::from(
+            exceptions::UnsupportedAlgorithm::new_err((
+                "None of the signature algorithms in the PKCS7 data are supported.",
+                exceptions::Reasons::UNSUPPORTED_SERIALIZATION,
+            )),
+        ))
+    }
+}
+
 pub(crate) fn symmetric_decrypt(
     py: pyo3::Python<'_>,
     algorithm: pyo3::Bound<'_, pyo3::PyAny>,
@@ -677,6 +916,15 @@ fn compute_pkcs7_signature_algorithm<'p>(
 ) -> pyo3::PyResult<common::AlgorithmIdentifier<'static>> {
     let key_type = x509::sign::identify_key_type(py, private_key.clone())?;
     let has_pss_padding = rsa_padding.is_instance(&types::PSS.get(py)?)?;
+    // ML-DSA signatures are always pure (pre-hashless) and the algorithm OID
+    // fully identifies the parameter set, so no hash algorithm is associated
+    // with the signature algorithm itself. See RFC 9882.
+    let hash_algorithm = match key_type {
+        x509::sign::KeyType::MlDsa44
+        | x509::sign::KeyType::MlDsa65
+        | x509::sign::KeyType::MlDsa87 => py.None().into_bound(py),
+        _ => hash_algorithm,
+    };
     // For RSA signatures (with no PSS padding), the OID is always the same no matter the
     // digest algorithm. See RFC 3370 (section 3.2).
     if key_type == x509::sign::KeyType::Rsa && !has_pss_padding {
@@ -876,7 +1124,7 @@ pub(crate) mod pkcs7_mod {
     use super::{
         decrypt_der, decrypt_pem, decrypt_smime, encrypt_and_serialize,
         load_der_pkcs7_certificates, load_pem_pkcs7_certificates, serialize_certificates,
-        sign_and_serialize,
+        sign_and_serialize, verify_der, verify_pem,
     };
 }
 

@@ -8,6 +8,16 @@ Changelog
 
 .. note:: This version is not yet released and is under active development.
 
+* :class:`~cryptography.hazmat.primitives.serialization.pkcs7.PKCS7SignatureBuilder`
+  now supports signing with ML-DSA-44, ML-DSA-65, and ML-DSA-87 keys,
+  following :rfc:`9882`. A single PKCS7 message may carry both classical and
+  post-quantum signatures to ease migration.
+* Added
+  :func:`~cryptography.hazmat.primitives.serialization.pkcs7.pkcs7_verify_der`
+  and
+  :func:`~cryptography.hazmat.primitives.serialization.pkcs7.pkcs7_verify_pem`
+  for verifying PKCS7 ``SignedData`` messages, including messages with
+  multiple signers.
 * Require CFFI 2.1.1 or newer on Python 3.15 to avoid an ABI issue in
   earlier CFFI releases.
 * X.509 names now reject IA5String attributes containing non-ASCII

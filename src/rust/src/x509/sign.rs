@@ -478,7 +478,7 @@ fn identify_alg_params_for_hash_type(
     }
 }
 
-fn hash_oid_py_hash(
+pub(crate) fn hash_oid_py_hash(
     py: pyo3::Python<'_>,
     oid: asn1::ObjectIdentifier,
 ) -> CryptographyResult<pyo3::Bound<'_, pyo3::PyAny>> {

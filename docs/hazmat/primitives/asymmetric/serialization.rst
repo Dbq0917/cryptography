@@ -1174,9 +1174,22 @@ contain certificates, CRLs, and much more. PKCS7 files commonly have a ``p7b``,
 
     .. versionadded:: 40.0.0
 
+    .. versionchanged:: 51.0.0
+        Added support for
+        :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA44PrivateKey`,
+        :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA65PrivateKey`,
+        and
+        :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA87PrivateKey`.
+
     Type alias: A union of private key types supported for PKCS7 serialization:
     :class:`~cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey` or
     :class:`~cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePrivateKey`
+    or
+    :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA44PrivateKey`
+    or
+    :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA65PrivateKey`
+    or
+    :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA87PrivateKey`
 
 .. function:: load_pem_pkcs7_certificates(data)
 
@@ -1372,8 +1385,19 @@ contain certificates, CRLs, and much more. PKCS7 files commonly have a ``p7b``,
         :param private_key: The
             :class:`~cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey` or
             :class:`~cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePrivateKey`
+            or
+            :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA44PrivateKey` or
+            :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA65PrivateKey` or
+            :class:`~cryptography.hazmat.primitives.asymmetric.mldsa.MLDSA87PrivateKey`
             associated with the certificate provided
             (matches :data:`PKCS7PrivateKeyTypes`).
+
+            .. versionchanged:: 51.0.0
+                Added support for ML-DSA private keys. ML-DSA signatures
+                follow :rfc:`9882`: the signature algorithm is identified by
+                the ML-DSA OID (with absent parameters), while
+                ``hash_algorithm`` is still used for the content message
+                digest.
 
         :param hash_algorithm: The
             :class:`~cryptography.hazmat.primitives.hashes.HashAlgorithm` that
@@ -1482,6 +1506,92 @@ contain certificates, CRLs, and much more. PKCS7 files commonly have a ``p7b``,
             are supported, and cannot be used at the same time.
 
         :returns bytes: The enveloped PKCS7 message.
+
+.. function:: pkcs7_verify_der(data, content=None, certificates=None)
+
+    .. versionadded:: 51.0.0
+
+    Verify the signatures in a DER-encoded PKCS7 ``SignedData`` message.
+
+    Each signer in the message is checked independently, dispatching on the
+    signature algorithm identifier carried in the message. RSA (PKCS1 v1.5
+    and PSS), ECDSA, and ML-DSA (:rfc:`9882`) signatures are supported;
+    signers using any other algorithm are skipped. Verification succeeds as
+    soon as one signer with a supported algorithm verifies against its
+    certificate, and fails only if no signer verifies.
+
+    .. warning::
+
+        This performs cryptographic verification of the signatures only. It
+        does **not** build or validate a certificate chain, so it does not
+        establish that any signer is trusted. Callers must evaluate trust in
+        the signer certificates themselves, for example with
+        :doc:`/x509/verification`.
+
+    :param data: The PKCS7 data, encoded in DER format.
+    :type data: bytes
+
+    :param content: The detached content, if the signature was created with
+        :attr:`~cryptography.hazmat.primitives.serialization.pkcs7.PKCS7Options.DetachedSignature`.
+        Must be ``None`` (the default) when the content is embedded in the
+        PKCS7 data.
+    :type content: bytes or None
+
+    :param certificates: Additional
+        :class:`~cryptography.x509.Certificate` instances to locate signer
+        keys with. Certificates embedded in the PKCS7 data are always used;
+        this parameter is only needed when the message was created with
+        :attr:`~cryptography.hazmat.primitives.serialization.pkcs7.PKCS7Options.NoCerts`.
+    :type certificates: list or None
+
+    :returns: None
+
+    :raises ValueError: If the PKCS7 data could not be parsed, is not a
+        ``SignedData`` structure, or if ``content`` is missing (detached
+        signature) or was provided for a message with embedded content.
+
+    :raises cryptography.exceptions.InvalidSignature: If no signer with a
+        supported algorithm has a valid signature.
+
+    :raises cryptography.exceptions.UnsupportedAlgorithm: If none of the
+        signers uses a supported signature algorithm.
+
+.. function:: pkcs7_verify_pem(data, content=None, certificates=None)
+
+    .. versionadded:: 51.0.0
+
+    Like :func:`pkcs7_verify_der`, but takes PEM-encoded PKCS7 data.
+
+    :param data: The PKCS7 data, encoded in PEM format.
+    :type data: bytes
+
+    :param content: See :func:`pkcs7_verify_der`.
+
+    :param certificates: See :func:`pkcs7_verify_der`.
+
+    :returns: None
+
+    :raises ValueError: If the PEM data could not be parsed. See
+        :func:`pkcs7_verify_der` for the other possible errors.
+
+Migrating to post-quantum signatures
+""""""""""""""""""""""""""""""""""""
+
+PKCS7 ``SignedData`` messages can carry multiple signatures over the same
+content. During a migration from classical algorithms (RSA, ECDSA) to the
+post-quantum ML-DSA family, signers can attach **both** a classical and an
+ML-DSA signature by calling
+:meth:`PKCS7SignatureBuilder.add_signer` once per key. Recipients that
+already support ML-DSA will verify the ML-DSA signature, while recipients
+that have not upgraded yet keep verifying the classical one;
+:func:`pkcs7_verify_der` accepts the message as long as at least one
+signature verifies with a supported algorithm.
+
+The classical signature should only be dropped once all relying parties
+have confirmed ML-DSA verification support. We recommend running the
+parallel (dual-signature) period for at least two quarters, and agreeing
+on the cut-over date with the consumers of the signatures rather than
+choosing it unilaterally.
 
 .. function:: pkcs7_decrypt_der(data, certificate, private_key, options)
 

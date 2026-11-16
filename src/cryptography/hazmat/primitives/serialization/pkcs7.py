@@ -16,7 +16,12 @@ from cryptography import utils, x509
 from cryptography.exceptions import UnsupportedAlgorithm, _Reasons
 from cryptography.hazmat.bindings._rust import pkcs7 as rust_pkcs7
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import (
+    ec,
+    mldsa,
+    padding,
+    rsa,
+)
 from cryptography.hazmat.primitives.ciphers import (
     algorithms,
 )
@@ -28,6 +33,10 @@ load_der_pkcs7_certificates = rust_pkcs7.load_der_pkcs7_certificates
 
 serialize_certificates = rust_pkcs7.serialize_certificates
 
+pkcs7_verify_der = rust_pkcs7.verify_der
+
+pkcs7_verify_pem = rust_pkcs7.verify_pem
+
 PKCS7HashTypes = typing.Union[
     hashes.SHA224,
     hashes.SHA256,
@@ -36,7 +45,11 @@ PKCS7HashTypes = typing.Union[
 ]
 
 PKCS7PrivateKeyTypes = typing.Union[
-    rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey
+    rsa.RSAPrivateKey,
+    ec.EllipticCurvePrivateKey,
+    mldsa.MLDSA44PrivateKey,
+    mldsa.MLDSA65PrivateKey,
+    mldsa.MLDSA87PrivateKey,
 ]
 
 ContentEncryptionAlgorithm = typing.Union[
@@ -103,9 +116,18 @@ class PKCS7SignatureBuilder:
             raise TypeError("certificate must be a x509.Certificate")
 
         if not isinstance(
-            private_key, (rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey)
+            private_key,
+            (
+                rsa.RSAPrivateKey,
+                ec.EllipticCurvePrivateKey,
+                mldsa.MLDSA44PrivateKey,
+                mldsa.MLDSA65PrivateKey,
+                mldsa.MLDSA87PrivateKey,
+            ),
         ):
-            raise TypeError("Only RSA & EC keys are supported at this time.")
+            raise TypeError(
+                "Only RSA, EC, and ML-DSA keys are supported at this time."
+            )
 
         if rsa_padding is not None:
             if not isinstance(rsa_padding, (padding.PSS, padding.PKCS1v15)):

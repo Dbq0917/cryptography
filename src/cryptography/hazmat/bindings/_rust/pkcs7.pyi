@@ -48,3 +48,13 @@ def load_pem_pkcs7_certificates(
 def load_der_pkcs7_certificates(
     data: bytes,
 ) -> list[x509.Certificate]: ...
+def verify_der(
+    data: bytes,
+    content: bytes | None = None,
+    certificates: list[x509.Certificate] | None = None,
+) -> None: ...
+def verify_pem(
+    data: bytes,
+    content: bytes | None = None,
+    certificates: list[x509.Certificate] | None = None,
+) -> None: ...

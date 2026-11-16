@@ -59,6 +59,56 @@ fn test_parse_certificate(data: &[u8]) -> CryptographyResult<TestCertificate> {
     })
 }
 
+#[cfg(not(any(
+    CRYPTOGRAPHY_IS_BORINGSSL,
+    CRYPTOGRAPHY_IS_AWSLC,
+    CRYPTOGRAPHY_IS_LIBRESSL
+)))]
+#[pyo3::pyfunction]
+#[pyo3(signature = (encoding, sig, msg, certs, options))]
+fn cms_verify(
+    py: pyo3::Python<'_>,
+    encoding: crate::serialization::Encoding,
+    sig: &[u8],
+    msg: Option<CffiBuf<'_>>,
+    certs: Vec<pyo3::Py<PyCertificate>>,
+    options: pyo3::Bound<'_, pyo3::types::PyList>,
+) -> CryptographyResult<()> {
+    let mut cms = match encoding {
+        crate::serialization::Encoding::DER => openssl::cms::CmsContentInfo::from_der(sig)?,
+        crate::serialization::Encoding::PEM => openssl::cms::CmsContentInfo::from_pem(sig)?,
+        _ => {
+            return Err(
+                pyo3::exceptions::PyValueError::new_err("Only DER and PEM are supported").into(),
+            );
+        }
+    };
+
+    let mut flags = openssl::cms::CMSOptions::empty();
+    if options.contains(types::PKCS7_BINARY.get(py)?)? {
+        flags |= openssl::cms::CMSOptions::BINARY;
+    }
+
+    let store = {
+        let mut b = openssl::x509::store::X509StoreBuilder::new()?;
+        for cert in &certs {
+            let der = asn1::write_single(cert.get().raw.borrow_dependent())?;
+            b.add_cert(openssl::x509::X509::from_der(&der)?)?;
+        }
+        b.build()
+    };
+
+    cms.verify(
+        None,
+        Some(&store),
+        msg.as_ref().map(|m| m.as_bytes()),
+        None,
+        flags,
+    )?;
+
+    Ok(())
+}
+
 #[cfg(not(any(CRYPTOGRAPHY_IS_BORINGSSL, CRYPTOGRAPHY_IS_AWSLC)))]
 #[pyo3::pyfunction]
 #[pyo3(signature = (encoding, sig, msg, certs, options))]
@@ -104,6 +154,13 @@ fn pkcs7_verify(
 
 #[pyo3::pymodule(gil_used = false)]
 pub(crate) mod test_support {
+    #[cfg(not(any(
+        CRYPTOGRAPHY_IS_BORINGSSL,
+        CRYPTOGRAPHY_IS_AWSLC,
+        CRYPTOGRAPHY_IS_LIBRESSL
+    )))]
+    #[pymodule_export]
+    use super::cms_verify;
     #[cfg(not(any(CRYPTOGRAPHY_IS_BORINGSSL, CRYPTOGRAPHY_IS_AWSLC)))]
     #[pymodule_export]
     use super::pkcs7_verify;

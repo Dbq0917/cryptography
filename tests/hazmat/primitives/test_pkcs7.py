@@ -4,6 +4,7 @@
 
 
 import contextlib
+import datetime
 import email.parser
 import os
 import typing
@@ -20,7 +21,13 @@ from cryptography.hazmat.bindings._rust import (
     test_support,
 )
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import (
+    ec,
+    ed25519,
+    mldsa,
+    padding,
+    rsa,
+)
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 from tests.doubles import DummyRSAPrivateKey
@@ -175,6 +182,23 @@ def _load_cert_key():
         mode="rb",
     )
     return cert, key
+
+
+def _self_signed_cert(key, hash_algorithm):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    name = x509.Name(
+        [x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "cryptography.io")]
+    )
+    return (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .sign(key, hash_algorithm)
+    )
 
 
 @pytest.mark.supported(
@@ -894,6 +918,75 @@ class TestPKCS7SignatureBuilder:
             sig.count(rsa_cert.public_bytes(serialization.Encoding.DER)) == 2
         )
 
+    @pytest.mark.supported(
+        only_if=lambda backend: backend.mldsa_supported(),
+        skip_message="Requires a backend with ML-DSA support",
+    )
+    @pytest.mark.parametrize(
+        ("private_key_class", "oid_arc"),
+        [
+            (mldsa.MLDSA44PrivateKey, b"\x11"),
+            (mldsa.MLDSA65PrivateKey, b"\x12"),
+            (mldsa.MLDSA87PrivateKey, b"\x13"),
+        ],
+    )
+    def test_sign_mldsa(self, private_key_class, oid_arc):
+        key = private_key_class.generate()
+        cert = _self_signed_cert(key, None)
+        data = b"hello world"
+        options = [pkcs7.PKCS7Options.Binary]
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA512())
+            .sign(serialization.Encoding.DER, options)
+        )
+        # The signature algorithm is identified by the ML-DSA OID from the
+        # NIST CSOR (2.16.840.1.101.3.4.3.17/18/19) with absent parameters,
+        # as RFC 9882 requires.
+        mldsa_alg_id = (
+            b"\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x03" + oid_arc
+        )
+        assert mldsa_alg_id in sig
+        # Verified both by OpenSSL (via CMS_verify, since the legacy
+        # PKCS7_verify API does not support ML-DSA) and by our own verifier.
+        test_support.cms_verify(
+            serialization.Encoding.DER,
+            sig,
+            None,
+            [cert],
+            options,
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
+    @pytest.mark.supported(
+        only_if=lambda backend: backend.mldsa_supported(),
+        skip_message="Requires a backend with ML-DSA support",
+    )
+    def test_sign_mldsa_and_rsa_multiple_signers(self):
+        # A container can carry a classical and a post-quantum signature
+        # over the same content, which is useful while migrating.
+        rsa_cert, rsa_key = _load_cert_key()
+        mldsa_key = mldsa.MLDSA65PrivateKey.generate()
+        mldsa_cert = _self_signed_cert(mldsa_key, None)
+        data = b"hello world"
+        options = [pkcs7.PKCS7Options.Binary]
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(rsa_cert, rsa_key, hashes.SHA256())
+            .add_signer(mldsa_cert, mldsa_key, hashes.SHA512())
+            .sign(serialization.Encoding.DER, options)
+        )
+        test_support.cms_verify(
+            serialization.Encoding.DER,
+            sig,
+            None,
+            [rsa_cert, mldsa_cert],
+            options,
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
 
 def _load_rsa_cert_key():
     key = load_vectors_from_file(
@@ -1592,3 +1685,278 @@ class TestPKCS7DecryptUnsupported:
         cert, key = _load_rsa_cert_key()
         with raises_unsupported_algorithm(_Reasons.UNSUPPORTED_PADDING):
             pkcs7.pkcs7_decrypt_der(b"", cert, key, [])
+
+
+class TestPKCS7Verify:
+    def test_verify_not_bytes(self):
+        with pytest.raises(TypeError):
+            pkcs7.pkcs7_verify_der(typing.cast(typing.Any, 38))
+        with pytest.raises(TypeError):
+            pkcs7.pkcs7_verify_pem(typing.cast(typing.Any, 38))
+
+    def test_verify_invalid_der(self):
+        with pytest.raises(ValueError):
+            pkcs7.pkcs7_verify_der(b"nonsense")
+
+    def test_verify_invalid_pem(self):
+        with pytest.raises(ValueError):
+            pkcs7.pkcs7_verify_pem(b"nonsense")
+
+        with pytest.raises(ValueError):
+            pkcs7.pkcs7_verify_pem(b"""
+-----BEGIN CERTIFICATE-----
+-----END CERTIFICATE-----
+            """)
+
+    def test_verify_not_signed_data(self):
+        cert, _ = _load_rsa_cert_key()
+        envelope = (
+            pkcs7.PKCS7EnvelopeBuilder()
+            .set_data(b"hello world")
+            .add_recipient(cert)
+            .encrypt(serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary])
+        )
+        with pytest.raises(ValueError):
+            pkcs7.pkcs7_verify_der(envelope)
+
+    def test_verify_rsa(self):
+        cert, key = _load_cert_key()
+        data = b"hello world"
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary])
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
+    def test_verify_rsa_pss(self):
+        cert, key = _load_rsa_cert_key()
+        data = b"hello world"
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(
+                cert,
+                key,
+                hashes.SHA256(),
+                rsa_padding=padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH,
+                ),
+            )
+            .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary])
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
+    def test_verify_ec(self):
+        key = ec.generate_private_key(ec.SECP256R1())
+        cert = _self_signed_cert(key, hashes.SHA256())
+        data = b"hello world"
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA384())
+            .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary])
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
+    @pytest.mark.supported(
+        only_if=lambda backend: backend.mldsa_supported(),
+        skip_message="Requires a backend with ML-DSA support",
+    )
+    @pytest.mark.parametrize(
+        "private_key_class",
+        [
+            mldsa.MLDSA44PrivateKey,
+            mldsa.MLDSA65PrivateKey,
+            mldsa.MLDSA87PrivateKey,
+        ],
+    )
+    def test_verify_mldsa(self, private_key_class):
+        key = private_key_class.generate()
+        cert = _self_signed_cert(key, None)
+        data = b"hello world"
+        builder = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA512())
+        )
+        sig = builder.sign(
+            serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary]
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
+        detached_sig = builder.sign(
+            serialization.Encoding.DER,
+            [pkcs7.PKCS7Options.Binary, pkcs7.PKCS7Options.DetachedSignature],
+        )
+        pkcs7.pkcs7_verify_der(detached_sig, content=data)
+
+    @pytest.mark.supported(
+        only_if=lambda backend: backend.mldsa_supported(),
+        skip_message="Requires a backend with ML-DSA support",
+    )
+    def test_verify_mldsa_openssl(self):
+        # Produced by OpenSSL 3.5 (openssl cms -sign -md sha512) with an
+        # ML-DSA-65 key; checks interoperability with third-party tools.
+        sig = load_vectors_from_file(
+            os.path.join("pkcs7", "mldsa65-openssl.der"),
+            lambda derfile: derfile.read(),
+            mode="rb",
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
+    def test_verify_ed25519_unsupported(self):
+        # Ed25519 is not a supported PKCS#7 signature algorithm, so this
+        # must fail with a clear error rather than a parse failure.
+        sig = load_vectors_from_file(
+            os.path.join("pkcs7", "ed25519-openssl.der"),
+            lambda derfile: derfile.read(),
+            mode="rb",
+        )
+        with raises_unsupported_algorithm(_Reasons.UNSUPPORTED_SERIALIZATION):
+            pkcs7.pkcs7_verify_der(sig)
+
+    def test_verify_multiple_signers_partially_supported(self):
+        # Signed by OpenSSL with both an RSA and an Ed25519 signer. The
+        # Ed25519 signer is skipped and the RSA signature verifies.
+        sig = load_vectors_from_file(
+            os.path.join("pkcs7", "rsa-ed25519-multi-signer-openssl.der"),
+            lambda derfile: derfile.read(),
+            mode="rb",
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
+    def test_verify_detached(self):
+        cert, key = _load_cert_key()
+        data = b"hello world"
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(
+                serialization.Encoding.DER,
+                [
+                    pkcs7.PKCS7Options.Binary,
+                    pkcs7.PKCS7Options.DetachedSignature,
+                ],
+            )
+        )
+        pkcs7.pkcs7_verify_der(sig, content=data)
+
+    def test_verify_detached_no_content(self):
+        cert, key = _load_cert_key()
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(b"hello world")
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(
+                serialization.Encoding.DER,
+                [
+                    pkcs7.PKCS7Options.Binary,
+                    pkcs7.PKCS7Options.DetachedSignature,
+                ],
+            )
+        )
+        with pytest.raises(ValueError):
+            pkcs7.pkcs7_verify_der(sig)
+
+    def test_verify_content_and_embedded_content(self):
+        cert, key = _load_cert_key()
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(b"hello world")
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary])
+        )
+        with pytest.raises(ValueError):
+            pkcs7.pkcs7_verify_der(sig, content=b"hello world")
+
+    def test_verify_no_attributes(self):
+        cert, key = _load_cert_key()
+        data = b"hello world"
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(
+                serialization.Encoding.DER,
+                [pkcs7.PKCS7Options.Binary, pkcs7.PKCS7Options.NoAttributes],
+            )
+        )
+        pkcs7.pkcs7_verify_der(sig)
+
+    def test_verify_tampered_content(self):
+        cert, key = _load_cert_key()
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(b"hello world")
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(
+                serialization.Encoding.DER,
+                [
+                    pkcs7.PKCS7Options.Binary,
+                    pkcs7.PKCS7Options.DetachedSignature,
+                ],
+            )
+        )
+        with pytest.raises(exceptions.InvalidSignature):
+            pkcs7.pkcs7_verify_der(sig, content=b"goodbye world")
+
+    def test_verify_tampered_signature(self):
+        cert, key = _load_cert_key()
+        data = b"hello world"
+        sig = bytearray(
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary])
+        )
+        # The signature itself is at the end of the SignerInfo, so corrupt
+        # the final byte.
+        sig[-1] ^= 0x01
+        with pytest.raises(exceptions.InvalidSignature):
+            pkcs7.pkcs7_verify_der(bytes(sig))
+
+    def test_verify_pem(self):
+        cert, key = _load_cert_key()
+        data = b"hello world"
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(serialization.Encoding.PEM, [pkcs7.PKCS7Options.Binary])
+        )
+        pkcs7.pkcs7_verify_pem(sig)
+
+    def test_verify_no_certs(self):
+        cert, key = _load_cert_key()
+        data = b"hello world"
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(cert, key, hashes.SHA256())
+            .sign(
+                serialization.Encoding.DER,
+                [pkcs7.PKCS7Options.Binary, pkcs7.PKCS7Options.NoCerts],
+            )
+        )
+        # The signer certificate is not embedded, so it must be supplied.
+        with pytest.raises(exceptions.InvalidSignature):
+            pkcs7.pkcs7_verify_der(sig)
+        pkcs7.pkcs7_verify_der(sig, certificates=[cert])
+
+    def test_verify_multiple_signers(self):
+        rsa_cert, rsa_key = _load_cert_key()
+        ec_key = ec.generate_private_key(ec.SECP256R1())
+        ec_cert = _self_signed_cert(ec_key, hashes.SHA256())
+        data = b"hello world"
+        sig = (
+            pkcs7.PKCS7SignatureBuilder()
+            .set_data(data)
+            .add_signer(rsa_cert, rsa_key, hashes.SHA256())
+            .add_signer(ec_cert, ec_key, hashes.SHA384())
+            .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.Binary])
+        )
+        pkcs7.pkcs7_verify_der(sig)
